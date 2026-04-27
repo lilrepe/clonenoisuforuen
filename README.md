@@ -1,6 +1,6 @@
-# NeuroFusionNet
+# abcdxyz
 
-Minimal PyTorch implementation of **NeuroFusionNet**, a hybrid EEG feature fusion framework for Alzheimer's Disease detection.
+Minimal PyTorch implementation of **abcdxyz**, a hybrid EEG feature fusion framework for Alzheimer's Disease detection.
 
 > Akbar et al., "NeuroFusionNet: a hybrid EEG feature fusion framework for accurate and explainable Alzheimer's Disease detection," *Scientific Reports* (2025) 15:43742. DOI: https://doi.org/10.1038/s41598-025-28070-x
 
