@@ -65,53 +65,142 @@ class EEGDataset(Dataset):
 # §Data acquisition — "88 subjects (AD:36, FTD:23, CN:29), 500 Hz, 18 channels"
 # ---------------------------------------------------------------------------
 
-def load_openneuro_raw(
-    dataset_path: str,
-    condition: str = "eyes_closed",  # "eyes_closed" (ds004504) or "eyes_open" (ds006036)
-) -> Tuple[List[np.ndarray], List[int], List[str]]:
-    """Load raw EEG from OpenNeuro BIDS-format datasets.
+def download_openneuro(dataset_id: str, target_dir: str, version: str = "1.0.8") -> None:
+    """Download an OpenNeuro dataset using openneuro-py.
 
-    §Data acquisition:
-      - ds004504: eyes-closed, 88 subjects (AD:36, FTD:23, CN:29)
-      - ds006036: eyes-open, same 88 subjects
-      - 500 Hz sampling rate
-      - 18 electrodes (10-20 system), A1-A2 references
-      - Format: BIDS .tsv / .csv / .h5 (check dataset readme)
-
-    Download:
-      ds004504: https://openneuro.org/datasets/ds004504/versions/1.0.8
-      ds006036: https://openneuro.org/datasets/ds006036/versions/1.0.2
+    Install: pip install openneuro-py
 
     Args:
-        dataset_path: Local path to downloaded BIDS dataset root
-        condition: Dataset variant identifier (for logging)
+        dataset_id: e.g. "ds004504" or "ds006036"
+        target_dir: Local directory to download into
+        version: Dataset version string
+
+    Example:
+        download_openneuro("ds004504", "data/ds004504", version="1.0.8")
+        download_openneuro("ds006036", "data/ds006036", version="1.0.2")
+    """
+    try:
+        import openneuro
+    except ImportError:
+        raise ImportError("Run: pip install openneuro-py")
+
+    openneuro.download(
+        dataset=dataset_id,
+        target_dir=target_dir,
+        verify_hash=False,  # skip slow hash verification for large EEG files
+    )
+
+
+def load_openneuro_raw(
+    dataset_path: str,
+    condition: str = "eyes_closed",
+) -> Tuple[List[np.ndarray], List[int], List[str]]:
+    """Load raw EEG from an OpenNeuro BIDS dataset using MNE-BIDS.
+
+    §Data acquisition:
+      ds004504 — eyes-closed, 88 subjects (AD:36, FTD:23, CN:29), 500 Hz, 18 ch
+      ds006036 — eyes-open,   same 88 subjects, 500 Hz, 18 ch
+
+    Requires: pip install mne mne-bids
+
+    BIDS layout for these datasets:
+      {root}/participants.tsv          ← diagnosis column: "A", "F", "C"
+      {root}/sub-{id}/eeg/
+            sub-{id}_task-eyesclosed_eeg.set   (EEGLAB .set format)
+            sub-{id}_task-eyesclosed_eeg.fdt
+
+    Args:
+        dataset_path: Local path to the downloaded BIDS root directory
+        condition: For logging only ("eyes_closed" or "eyes_open")
 
     Returns:
-        recordings: List of EEG arrays, one per subject — each shape: (T, C)
-        labels: Integer class label per subject (0=AD, 1=FTD, 2=CN)
-        subject_ids: Subject identifiers (for stratified split)
-
-    Raises:
-        NotImplementedError: Implement based on your local BIDS file structure.
+        recordings:  List of EEG arrays, shape (T, C), one per subject
+        labels:      Integer class label per subject — 0=AD, 1=FTD, 2=CN
+        subject_ids: Subject ID strings (e.g. "sub-001")
     """
-    # TODO: Implement based on local file layout.
-    # Typical BIDS structure:
-    #   {dataset_path}/sub-{id}/eeg/sub-{id}_task-eyesclosed_eeg.set  (or .fif, .tsv)
-    #
-    # Recommended library: MNE-Python
-    #   pip install mne
-    #   raw = mne.io.read_raw_eeglab(path, preload=True)
-    #   data = raw.get_data().T  # (T, C)
-    #
-    # Label assignment:
-    #   Check participants.tsv for diagnosis column:
-    #   "A" or "Alzheimer" → 0 (AD)
-    #   "F" or "FTD"       → 1 (FTD)
-    #   "C" or "Control"   → 2 (CN)
-    raise NotImplementedError(
-        "Implement load_openneuro_raw() based on your local file layout. "
-        "See docstring for guidance. Recommended: MNE-Python."
+    try:
+        import mne
+        import mne_bids
+        import pandas as pd
+    except ImportError:
+        raise ImportError("Run: pip install mne mne-bids pandas")
+
+    root = Path(dataset_path)
+
+    # ── 1. Read participants.tsv to get diagnosis labels ──────────────────
+    participants_file = root / "participants.tsv"
+    if not participants_file.exists():
+        raise FileNotFoundError(f"participants.tsv not found in {root}")
+
+    participants = pd.read_csv(participants_file, sep="\t")
+    # ds004504/ds006036 use column "Group": "A" (AD), "F" (FTD), "C" (Control)
+    GROUP_MAP = {"A": 0, "F": 1, "C": 2}
+    # Fallback column names seen in OpenNeuro EEG datasets
+    group_col = next(
+        (c for c in ["Group", "group", "diagnosis", "Diagnosis"] if c in participants.columns),
+        None,
     )
+    if group_col is None:
+        raise ValueError(
+            f"Could not find a diagnosis column in participants.tsv. "
+            f"Columns found: {list(participants.columns)}"
+        )
+
+    # ── 2. Discover EEG files via MNE-BIDS ───────────────────────────────
+    layout = mne_bids.BIDSPath(root=str(root))
+    bids_paths = mne_bids.find_matching_paths(
+        root=str(root),
+        datatypes="eeg",
+        suffixes="eeg",
+        extensions=[".set", ".fif", ".edf", ".bdf"],
+    )
+
+    recordings: List[np.ndarray] = []
+    labels: List[int] = []
+    subject_ids: List[str] = []
+
+    for bids_path in bids_paths:
+        subject = bids_path.subject  # e.g. "001"
+        sub_id = f"sub-{subject}"
+
+        # Look up diagnosis for this subject
+        row = participants[participants["participant_id"] == sub_id]
+        if row.empty:
+            continue
+        group_str = str(row.iloc[0][group_col]).strip().upper()
+        if group_str not in GROUP_MAP:
+            continue
+        label = GROUP_MAP[group_str]
+
+        # Load raw EEG with MNE
+        try:
+            raw = mne_bids.read_raw_bids(bids_path, verbose=False)
+            raw.load_data()
+        except Exception as e:
+            print(f"  ⚠ Could not load {bids_path}: {e}")
+            continue
+
+        # §Data acquisition — "18 electrodes... 500 Hz"
+        # Return as (T, C) array matching preprocessing pipeline expectation
+        data = raw.get_data()  # (C, T) in MNE convention
+        data = data.T           # → (T, C)
+
+        recordings.append(data)
+        labels.append(label)
+        subject_ids.append(sub_id)
+
+    if not recordings:
+        raise RuntimeError(
+            f"No EEG files loaded from {dataset_path}. "
+            "Check that the dataset was fully downloaded and the BIDS structure is intact."
+        )
+
+    print(
+        f"Loaded {len(recordings)} subjects from {dataset_path} ({condition}). "
+        f"Class distribution: "
+        + ", ".join(f"{k}={labels.count(v)}" for k, v in {"AD":0,"FTD":1,"CN":2}.items())
+    )
+    return recordings, labels, subject_ids
 
 
 def load_osf_raw(dataset_path: str) -> Tuple[List[np.ndarray], List[int], List[str]]:
@@ -120,30 +209,89 @@ def load_osf_raw(dataset_path: str) -> Tuple[List[np.ndarray], List[int], List[s
     §Data acquisition (Table 4):
       - 109 subjects: AD (49), MCI (37), HC (23)
       - 128 Hz sampling rate
-      - 21 channels
-      - Eyes-closed resting state
-      - 8-second segments
+      - 21 channels, eyes-closed resting state, 8-second segments
 
     Download: https://osf.io/2v5md/
 
+    The OSF dataset (Rezaee & Zhu, 2025) stores data as .mat files:
+      {dataset_path}/
+        AD/     ← sub-*.mat  (or AD_*.mat)
+        MCI/    ← sub-*.mat
+        HC/     ← sub-*.mat
+      OR a flat structure with a labels CSV.
+
+    Requires: pip install scipy
+
     Args:
-        dataset_path: Local path to downloaded OSF dataset
+        dataset_path: Local path to the downloaded OSF dataset root
 
     Returns:
-        recordings: List of EEG arrays — each shape: (T, C)
-        labels: Integer class label (0=AD, 1=MCI, 2=HC)
-        subject_ids: Subject identifiers
-
-    Raises:
-        NotImplementedError: Implement based on local file structure.
+        recordings:  List of EEG arrays, shape (T, C)
+        labels:      0=AD, 1=MCI, 2=HC
+        subject_ids: Filename stems used as subject IDs
     """
-    # TODO: Implement. OSF datasets typically use .mat or .csv format.
-    # Check the OSF repository page for file structure documentation.
-    raise NotImplementedError(
-        "Implement load_osf_raw() based on the OSF dataset file layout. "
-        "Typical format: .mat (scipy.io.loadmat) or .csv (numpy.loadtxt). "
-        "Download from: https://osf.io/2v5md/"
+    import scipy.io as sio
+
+    root = Path(dataset_path)
+    CLASS_DIRS = {"AD": 0, "MCI": 1, "HC": 2}
+
+    recordings: List[np.ndarray] = []
+    labels: List[int] = []
+    subject_ids: List[str] = []
+
+    # Strategy 1: class-named subdirectories (common OSF layout)
+    for class_name, label in CLASS_DIRS.items():
+        class_dir = root / class_name
+        if not class_dir.exists():
+            continue
+        for mat_file in sorted(class_dir.glob("*.mat")):
+            mat = sio.loadmat(str(mat_file))
+            # OSF dataset stores EEG in variable named 'data' or 'EEG'
+            eeg_key = next(
+                (k for k in mat.keys() if k in ("data", "EEG", "eeg", "x", "X")),
+                None,
+            )
+            if eeg_key is None:
+                # Fallback: use the first non-metadata key
+                eeg_key = next(k for k in mat.keys() if not k.startswith("_"))
+            arr = np.array(mat[eeg_key], dtype=np.float64)
+            # Ensure shape is (T, C)
+            if arr.ndim == 2 and arr.shape[0] < arr.shape[1]:
+                arr = arr.T  # (C, T) → (T, C)
+            recordings.append(arr)
+            labels.append(label)
+            subject_ids.append(mat_file.stem)
+
+    if not recordings:
+        # Strategy 2: flat directory with a CSV index file
+        index_file = next(root.glob("*.csv"), None)
+        if index_file is None:
+            raise FileNotFoundError(
+                f"Could not find class subdirectories (AD/MCI/HC) or a CSV index "
+                f"in {root}. Check the OSF download structure at https://osf.io/2v5md/"
+            )
+        import pandas as pd
+        index = pd.read_csv(index_file)
+        for _, row in index.iterrows():
+            mat_path = root / row["filename"]
+            label = CLASS_DIRS.get(str(row["label"]).upper(), -1)
+            if label == -1 or not mat_path.exists():
+                continue
+            mat = sio.loadmat(str(mat_path))
+            eeg_key = next(k for k in mat.keys() if not k.startswith("_"))
+            arr = np.array(mat[eeg_key], dtype=np.float64)
+            if arr.ndim == 2 and arr.shape[0] < arr.shape[1]:
+                arr = arr.T
+            recordings.append(arr)
+            labels.append(label)
+            subject_ids.append(mat_path.stem)
+
+    print(
+        f"Loaded {len(recordings)} subjects from OSF dataset. "
+        f"Class distribution: "
+        + ", ".join(f"{k}={labels.count(v)}" for k, v in CLASS_DIRS.items())
     )
+    return recordings, labels, subject_ids
 
 
 # ---------------------------------------------------------------------------
